@@ -2518,6 +2518,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(kv_exact_window_parity src/kernels/kv_exact_window_parity.cpp)
     target_include_directories(kv_exact_window_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(kv_exact_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    if(STRATA_ENABLE_HIP)
+      # the opt-in RDNA GEMVs (STRATA_RDNA_Q6K=1) against native_mmvq on synthetic weights, per format and column count
+      add_executable(rdna_mmvq_parity src/kernels/rdna_mmvq_parity.cpp)
+      target_include_directories(rdna_mmvq_parity PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(rdna_mmvq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    endif()
     if(STRATA_ENABLE_CUDA)
       # EXPDEC (docs/EXPERTDEC.md): the grouped experts' default kernels against STRATA_EXPDEC=1 at T = 1..4, bit for bit
       # and in microseconds, on synthetic blobs read cold from DRAM

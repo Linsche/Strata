@@ -17,6 +17,9 @@
 #ifndef STRATA_GR_WPE
 #define STRATA_GR_WPE 8
 #endif
+// RDNA-only builtins (DPP, permlanex16) and wave32: built only for the wave32 HIP backend. The CUDA and gfx906 builds
+// get the stubs at the end of this file (rdna_gr_enabled() is false there, so fused_gr_read_multi keeps its own path).
+#if defined(STRATA_USE_HIP)
 namespace strata::kernels {
 namespace {
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320, PR = LR + HC;   // partial rows: 320 down + 4 inject
@@ -168,8 +171,14 @@ __device__ __forceinline__ uint4 bf4f16(uint4 w) {
     return make_uint4(bf2f16(w.x), bf2f16(w.y), bf2f16(w.z), bf2f16(w.w));
 }
 __device__ __forceinline__ float d2f16(unsigned w, unsigned x, float acc) {
+#if defined(__GFX12__)
+    // gfx12 has no v_dot2c_f32_f16 (the VOP2 form); the builtin selects its VOP3 v_dot2_f32_f16, same products.
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(h2, w), __builtin_bit_cast(h2, x), acc, false);
+#else
     asm volatile("v_dot2c_f32_f16 %0, %1, %2" : "=v"(acc) : "v"(w), "v"(x), "0"(acc));
     return acc;
+#endif
 }
 __device__ __forceinline__ float dot8h(uint4 w, uint4 x, float acc) {   // 8 elements: 4 packed dots
     return d2f16(w.x, x.x, d2f16(w.y, x.y, d2f16(w.z, x.z, d2f16(w.w, x.w, acc))));
@@ -571,3 +580,12 @@ void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* s
     }
 }
 }  // namespace strata::kernels
+#else
+namespace strata::kernels {
+bool rdna_gr_enabled() { return false; }
+void rdna_gr_read_multi(const FusedGrArgs*, int, float*, void*, unsigned long long*, int) {
+    std::fprintf(stderr, "strata: rdna_gr_read_multi needs the wave32 HIP build\n");
+    std::abort();
+}
+}  // namespace strata::kernels
+#endif  // STRATA_USE_HIP

@@ -10,7 +10,12 @@
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"   // iq3s_grid (IQ3_S)
+#include "strata/kernels/dp4a.hpp"
 
+// The kernels below use RDNA-only builtins (DPP row_xmask, permlanex16) and assume wave32, so they are built only for
+// the wave32 HIP backend (STRATA_ENABLE_HIP, gfx10+). The CUDA and gfx906 (wave64) builds get the stubs at the end of
+// this file: rdna_q6k_enabled() is false there and every entry point returns false, so the native kernels run.
+#if defined(STRATA_USE_HIP)
 namespace strata::kernels {
 bool rdna_q6k_mmvq2(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream,
                     const void* w2, float* y2, int n_out2);
@@ -66,8 +71,8 @@ __global__ void __launch_bounds__(256) rdna_q6k_kernel(const uint8_t* __restrict
         for (int c = 0; c < NC; ++c) {
             const Q81* xb8 = x + (size_t) c * xs + sb * 8 + xb;
             const int* q = reinterpret_cast<const int*>(xb8->qs) + xi;
-            int s = __builtin_amdgcn_sudot4(true, w0, true, q[0], 0, false);
-            s = __builtin_amdgcn_sudot4(true, w1, true, q[1], s, false);
+            int s = STRATA_DP4A(w0, q[0], 0);
+            s = STRATA_DP4A(w1, q[1], s);
             acc[c] = fmaf(ds * __low2float(xb8->ds), (float) s, acc[c]);
         }
     }
@@ -82,12 +87,8 @@ __global__ void __launch_bounds__(256) rdna_q6k_kernel(const uint8_t* __restrict
 // superblock; K-quants take the min term from the lane's own activation sum (dot with ones) - same products,
 // another summation order than ggml's vec_dot.
 __device__ __forceinline__ int dot2(int w0, int w1, const int* q, int acc) {
-    acc = __builtin_amdgcn_sudot4(true, w0, true, q[0], acc, false);
-    return __builtin_amdgcn_sudot4(true, w1, true, q[1], acc, false);
-}
-__device__ __forceinline__ void kq_scale(const uint8_t* s, int j, int& sc, int& m) {
-    if (j < 4) { sc = s[j] & 63; m = s[j + 4] & 63; }
-    else { sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
+    acc = STRATA_DP4A(w0, q[0], acc);
+    return STRATA_DP4A(w1, q[1], acc);
 }
 __device__ __forceinline__ uint32_t iq4_lut4(uint32_t idx) {   // 4 nibble indices (one per byte) -> 4 int8 table values
     const uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;   // -127..-10 | 1..113
@@ -230,9 +231,6 @@ bool rdna_kq_mmvq2(int type, const void* w, const void* xq, float* y, int n_in, 
         default: return false;
     }
 }
-namespace {
-}  // namespace
-
 bool rdna_q6k_enabled() {
     static const bool on = [] { const char* v = std::getenv("STRATA_RDNA_Q6K"); return v != nullptr && v[0] == '1'; }();
     return on;
@@ -263,3 +261,12 @@ bool rdna_q6k_mmvq2(const void* w, const void* xq, float* y, int n_in, int n_out
     return true;
 }
 }  // namespace strata::kernels
+#else
+namespace strata::kernels {
+bool rdna_q6k_enabled() { return false; }
+bool rdna_q6k_mmvq(const void*, const void*, float*, int, int, int, void*) { return false; }
+bool rdna_q6k_mmvq2(const void*, const void*, float*, int, int, int, void*, const void*, float*, int) { return false; }
+bool rdna_kq_mmvq(int, const void*, const void*, float*, int, int, int, void*) { return false; }
+bool rdna_kq_mmvq2(int, const void*, const void*, float*, int, int, int, void*, const void*, float*, int) { return false; }
+}  // namespace strata::kernels
+#endif  // STRATA_USE_HIP
