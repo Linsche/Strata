@@ -77,19 +77,53 @@ __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long
         for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] >> 4) - 8) * d;
     }
 }
+// kOctLevel[code] (kv_octave.hpp) without a table in memory: the magnitudes 8, 24, 43, 69 packed in one constant, bit 2
+// of the code the sign.  The same integer as the table for every code, so every value below is unchanged bit for bit;
+// the table was a divergent per-lane load in the inner loops.
+__device__ __forceinline__ int oct_level(int code) {
+    static_assert(kOctLevel[0] == 8 && kOctLevel[1] == 24 && kOctLevel[2] == 43 && kOctLevel[3] == 69 &&
+                  kOctLevel[4] == -8 && kOctLevel[5] == -24 && kOctLevel[6] == -43 && kOctLevel[7] == -69,
+                  "oct_level packs kOctLevel");
+    const int mag = (int) ((0x452B1808u >> ((code & 3) * 8)) & 0xFFu);
+    return (code & 4) ? -mag : mag;
+}
+#if defined(__HIPCC__)
+// The codebook as bytes, so a v_perm_b32 maps four codes to four levels at once (qsa_prompt_attn.cu's oct_lv4).
+constexpr uint32_t kOctLvLo = (uint32_t) (uint8_t) kOctLevel[0] | ((uint32_t) (uint8_t) kOctLevel[1] << 8) |
+                              ((uint32_t) (uint8_t) kOctLevel[2] << 16) | ((uint32_t) (uint8_t) kOctLevel[3] << 24);
+constexpr uint32_t kOctLvHi = (uint32_t) (uint8_t) kOctLevel[4] | ((uint32_t) (uint8_t) kOctLevel[5] << 8) |
+                              ((uint32_t) (uint8_t) kOctLevel[6] << 16) | ((uint32_t) (uint8_t) kOctLevel[7] << 24);
+// four codes (one nibble of each bit plane) -> four level bytes, value j in byte j
+__device__ __forceinline__ uint32_t oct_lv4_dec(uint32_t a, uint32_t b, uint32_t c) {
+    const uint32_t m = 0x00204081u, k = 0x01010101u;
+    return __builtin_amdgcn_perm(kOctLvHi, kOctLvLo, ((a * m) & k) | (((b * m) & k) << 1) | (((c * m) & k) << 2));
+}
+#endif
+// 8 values from d0 (a multiple of 8: every caller passes lane * 8 or l * 8), so all 8 sit in the same byte of each of
+// the block's three bit planes: three byte loads instead of the 24 the per-value indexing compiled to.  The value is
+// level * (d / 32): d / 32 is exact (a power of two on an fp16-range scale), so the one rounding of the product is the
+// one of level / 32 * d, bit for bit.
 __device__ __forceinline__ void load8_oct(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     constexpr int bytes_per_head = (HD / QK_OCT) * sizeof(block_oct3);
     const int b = d0 / QK_OCT;
-    const int rem = d0 % QK_OCT;
+    const int by = (d0 % QK_OCT) >> 3;
     const block_oct3* blk = reinterpret_cast<const block_oct3*>((value ? p.v_q4 : p.k_q4) + row * bytes_per_head) + b;
-    const float d = __half2float(__ushort_as_half(blk->d));
-    const uint8_t* qs = blk->qs;
+    const float dd = __half2float(__ushort_as_half(blk->d)) * (1.0f / 32.0f);
+    const uint32_t b0 = blk->qs[by], b1 = blk->qs[4 + by], b2 = blk->qs[8 + by];
+#if defined(__HIPCC__)
+    const uint32_t lo = oct_lv4_dec(b0 & 0xFu, b1 & 0xFu, b2 & 0xFu), hi = oct_lv4_dec(b0 >> 4, b1 >> 4, b2 >> 4);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        out[k] = (float) (int) (int8_t) (lo >> (8 * k)) * dd;
+        out[4 + k] = (float) (int) (int8_t) (hi >> (8 * k)) * dd;
+    }
+#else
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
-        const int j = rem + k, by = j >> 3, bi = j & 7;
-        const int code = ((qs[by] >> bi) & 1) | (((qs[4 + by] >> bi) & 1) << 1) | (((qs[8 + by] >> bi) & 1) << 2);
-        out[k] = (float) kOctLevel[code] * (1.0f / 32.0f) * d;
+        const int code = (int) (((b0 >> k) & 1u) | (((b1 >> k) & 1u) << 1) | (((b2 >> k) & 1u) << 2));
+        out[k] = (float) oct_level(code) * dd;
     }
+#endif
 }
 /// The exact window's row (kv_exact_window.hpp): the same 8 values as fp16, straight out of the fp16 copy the append
 /// path keeps for the sinks and the newest `tail` cells.
@@ -324,7 +358,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
             const uint8_t* qs = blk->qs;
             const int by = rem >> 3, bi = rem & 7;
             const int code = ((qs[by] >> bi) & 1) | (((qs[4 + by] >> bi) & 1) << 1) | (((qs[8 + by] >> bi) & 1) << 2);
-            v = (float) kOctLevel[code] * (1.0f / 32.0f) * dv;
+            v = (float) oct_level(code) * (dv * (1.0f / 32.0f));   // = level / 32 * d bit for bit (load8_oct)
         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
             constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
             const int b = t / QK4_0;
@@ -594,7 +628,7 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
         const uint8_t* qs = blk->qs;
         const int by = rem >> 3, bi = rem & 7;
         const int code = ((qs[by] >> bi) & 1) | (((qs[4 + by] >> bi) & 1) << 1) | (((qs[8 + by] >> bi) & 1) << 2);
-        return (float) kOctLevel[code] * (1.0f / 32.0f) * dd;
+        return (float) oct_level(code) * (dd * (1.0f / 32.0f));   // = level / 32 * d bit for bit (load8_oct)
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -630,6 +664,11 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     // floats) and the block's shared memory stays what it was before the cell-major layout.
     float (*const spt)[G] = reinterpret_cast<float (*)[G]>(&sq[0][0]);
     static_assert(CHUNK * G <= G * HD, "spt must fit in sq");
+    // oct3 (KV_MODE 4): the exact fp16 window (kv_exact_window.hpp), as in attn_chunk_body - a cell the sinks or the
+    // newest `tail` still hold is read from there instead of from the codes.  Only oct3 pools carry a window, so every
+    // other format compiles exactly the kernel it did before (WIN false: wrow is never touched).
+    constexpr bool WIN = KV_MODE == 4;
+    __shared__ int wrow[WIN ? CHUNK : 1];         // exact window's row of each cell, -1: read the codes
     const int n_ids = __ldg(step + kStepWidth);
     const int chunk = blockIdx.x, kvh = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -645,12 +684,21 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
+            if constexpr (WIN) {
+                int w = -1;
+                if (p.win.present()) {   // the tag check keeps a ring row reused by a newer position a miss
+                    const int wr = kv_window_row(p.win, cell);
+                    if (wr >= 0 && __ldg(p.win.tag + wr) == cell) w = wr;
+                }
+                wrow[t] = w;
+            }
             const long long page = (long long) p.page_table[cell / page_size];
             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
         }
         srow[t] = r;
+        if constexpr (WIN) { if (t >= n_here) wrow[t] = -1; }
     }
     __syncthreads();
     // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.  NC cells per step
@@ -670,7 +718,10 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
         if (all_ok) {
             float kk[NC][8];
 #pragma unroll
-            for (int j = 0; j < NC; ++j) load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j]);
+            for (int j = 0; j < NC; ++j) {
+                if constexpr (WIN) load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j], wrow[cc[j]], kvh);
+                else load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j]);
+            }
             float pp[NC][16];
 #pragma unroll
             for (int h = 0; h < G; ++h) {
@@ -696,7 +747,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
                     continue;
                 }
                 float k8[8];
-                load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+                if constexpr (WIN) load8<KV_MODE>(p, false, srow[c], lane * 8, k8, wrow[c], kvh);
+                else load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
                 float part[16];
 #pragma unroll
                 for (int h = 0; h < G; ++h) {
@@ -741,22 +793,39 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
         acc[8] = fmaf(w2.x, v, acc[8]);  acc[9] = fmaf(w2.y, v, acc[9]);
         acc[10] = fmaf(w2.z, v, acc[10]); acc[11] = fmaf(w2.w, v, acc[11]);
     };
+    // oct3: one V element of cell c (pool row `row`), the window's fp16 copy when it holds the cell
+    const auto vload_win = [&](int c, long long row) -> float {
+        if (wrow[c] >= 0)
+            return __half2float(__ushort_as_half(
+                p.win.v[(size_t) wrow[c] * (size_t) (p.win.n_head_kv * HD) + (size_t) kvh * HD + t]));
+        return load_v1<KV_MODE>(p, row, t);
+    };
     int c = 0;
     // four cells at a time with their V loads issued together (the loop was one dependent load chain per cell);
     // a group holding a masked cell (page -1, rare) leaves this loop and the scalar one below finishes the chunk.
     for (; c + 4 <= n_here; c += 4) {
         const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
         if ((r0 | r1 | r2 | r3) < 0) break;
-        const float v0 = load_v1<KV_MODE>(p, r0, t), v1 = load_v1<KV_MODE>(p, r1, t);
-        const float v2 = load_v1<KV_MODE>(p, r2, t), v3 = load_v1<KV_MODE>(p, r3, t);
-        fold(c, v0);
-        fold(c + 1, v1);
-        fold(c + 2, v2);
-        fold(c + 3, v3);
+        if constexpr (WIN) {
+            const float v0 = vload_win(c, r0), v1 = vload_win(c + 1, r1);
+            const float v2 = vload_win(c + 2, r2), v3 = vload_win(c + 3, r3);
+            fold(c, v0);
+            fold(c + 1, v1);
+            fold(c + 2, v2);
+            fold(c + 3, v3);
+        } else {
+            const float v0 = load_v1<KV_MODE>(p, r0, t), v1 = load_v1<KV_MODE>(p, r1, t);
+            const float v2 = load_v1<KV_MODE>(p, r2, t), v3 = load_v1<KV_MODE>(p, r3, t);
+            fold(c, v0);
+            fold(c + 1, v1);
+            fold(c + 2, v2);
+            fold(c + 3, v3);
+        }
     }
     for (; c < n_here; ++c) {
         if (srow[c] < 0) continue;   // masked above, weight 0
-        fold(c, load_v1<KV_MODE>(p, srow[c], t));
+        if constexpr (WIN) fold(c, vload_win(c, srow[c]));
+        else fold(c, load_v1<KV_MODE>(p, srow[c], t));
     }
 #pragma unroll
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
@@ -968,7 +1037,9 @@ bool pre75_attn() {
 }
 // `PRE` picks PR #540's kernel; the environment's choice is STRATA_ATTN_CHUNK.
 #if defined(__HIPCC__)
-#define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M, 8, true> : attn_chunk_kernel<M>)
+// oct3 (M 4) takes 4 cells per step: its code expansion holds more registers, and at 8 the occupancy loss outweighed
+// the shared q reads saved (gfx1030, 32 queries x 2,048 cells at 16K: 0.99 ms at 8, 0.74 at 4, 0.78 at 2)
+#define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M, ((M) == 4 ? 4 : 8), true> : attn_chunk_kernel<M>)
 #else
 #define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
 #endif
@@ -1087,14 +1158,11 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else
 #endif
-    if (kv_mode == 4) {
-        if (pre) {
-            std::fprintf(stderr, "oct3 KV: the pre-sm_75 attention kernel has no oct3 mode\n");
-            std::exit(1);
-        }
-        attn_chunk_kernel<4><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                       scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-    } else if (kv_mode == 3)
+    if (kv_mode == 4)   // oct3: both kernels read the exact window
+        STRATA_ATTN_CHUNK_SEL(4, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
+                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
+                                                                n_chunks, (int) cap, stride);
+    else if (kv_mode == 3)
         STRATA_ATTN_CHUNK_SEL(3, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
                                                                 (int) s.page_size, scale, part_acc, part_m, part_l,
                                                                 n_chunks, (int) cap, stride);
@@ -1273,7 +1341,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         std::exit(1);
     }
     const int kv_mode = attn_kv_mode(pools);
-    if (kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
+    if (kv_mode == 4 ? (!pools.k_q4 || !pools.v_q4) : kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
                      : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
                                                                      : (!pools.k_pool || !pools.v_pool)))) {
         std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
@@ -1292,7 +1360,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                                                           scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else
 #endif
-    if (kv_mode == 3)
+    if (kv_mode == 4)   // oct3 (the engine's single-token step gathers instead: layer.cpp; this serves direct callers)
+        STRATA_ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+    else if (kv_mode == 3)
         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else if (kv_mode == 2)
