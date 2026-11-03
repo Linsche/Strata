@@ -60,6 +60,17 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         t.push_back({"STRATA_GR_Q8_PFS", "1"});
         return t;
     }
+    if (strata::kernels::gfx_arch_is(gcn_arch, "gfx1030")) {
+        // gfx1030 (RX 6800 / 6800 XT / 6900 XT, RDNA2): the GDN recurrence pair of the gfx12 table.  Measured on an RX 6800
+        // (Linux, ROCm, Qwen3.8-Flash-Next IQ3_S, k8v4): the gdn_rec_head kernel test bitwise on y16 and state, T=4096
+        // 9.51 ms -> 5.25 ms; in the engine, STRATA_PREFILL_TIMING at a 13.6K prompt, "gdn recurrence" 999 ms -> 643 ms
+        // (4 interleaved runs each), about -2.5% of the prompt.  CONVL2, NOY and the decode switches measured no gain here,
+        // so they stay out.  Other gfx103x cards were not measured.
+        const char* off103 = std::getenv("STRATA_GFX1030_DEFAULTS");
+        if (off103 != nullptr && off103[0] == '0') return t;
+        t = {{"STRATA_GDN_HEAD", "1"}, {"STRATA_GDN_PP", "2"}};
+        return t;
+    }
     if (!strata::kernels::gfx_arch_is_gfx1151(gcn_arch)) return t;
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     if (off != nullptr && off[0] == '0') return t;
@@ -256,10 +267,11 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
     }
     if (!set.empty()) {
         const bool g12 = strata::kernels::gfx_arch_is_gfx12(gcn_arch);
+        const bool g1030 = strata::kernels::gfx_arch_is(gcn_arch, "gfx1030");
         std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns "
                              "them off; a switch you set is kept): ",
-                     g12 ? "gfx12 (RDNA4)" : "gfx1151 (Strix Halo)", set.size(),
-                     g12 ? "STRATA_GFX12_DEFAULTS" : "STRATA_GFX1151_DEFAULTS");
+                     g12 ? "gfx12 (RDNA4)" : g1030 ? "gfx1030 (RDNA2)" : "gfx1151 (Strix Halo)", set.size(),
+                     g12 ? "STRATA_GFX12_DEFAULTS" : g1030 ? "STRATA_GFX1030_DEFAULTS" : "STRATA_GFX1151_DEFAULTS");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
     }
