@@ -521,6 +521,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/qsa_pattn.cu
+                          src/kernels/cuda/qsa_pattn_flash.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/dflash2.cu
                           src/kernels/cuda/iq_kernels.cu
@@ -1109,6 +1110,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_gemm_f16_io_parity PRIVATE strata_prefill strata_hip_runtime)
     add_test(NAME hip_gemm_f16_io_parity COMMAND hip_gemm_f16_io_parity)
     list(APPEND _strata_hip_tests hip_gemm_f16_io_parity)
+    add_executable(hip_qsa_pattn_flash tests/hip/qsa_pattn_flash.cpp)
+    target_link_libraries(hip_qsa_pattn_flash PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME hip_qsa_pattn_flash COMMAND hip_qsa_pattn_flash)
+    list(APPEND _strata_hip_tests hip_qsa_pattn_flash)
     add_executable(hip_q2_zero tests/hip/q2_zero.cpp)
     target_link_libraries(hip_q2_zero PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_q2_zero COMMAND hip_q2_zero)
