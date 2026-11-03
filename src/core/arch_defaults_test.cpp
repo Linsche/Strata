@@ -37,6 +37,19 @@ int main() {
     CHECK(arch_default_env("gfx11510").empty());   // not a prefix match
     CHECK(arch_default_env("").empty());
     CHECK(arch_default_env(nullptr).empty());
+    CHECK(arch_default_env("gfx1031").empty());    // other gfx103x: not measured
+    CHECK(arch_default_env("gfx1036").empty());
+    // gfx1030 (RX 6800): the GDN recurrence pair only, plain and with a feature suffix; STRATA_GFX1030_DEFAULTS=0 empties it
+    for (const char* a : {"gfx1030", "gfx1030:sramecc-:xnack-"}) {
+        const auto t = arch_default_env(a);
+        CHECK(t.size() == 2);
+        CHECK(t[0].first == "STRATA_GDN_HEAD" && t[0].second == "1");
+        CHECK(t[1].first == "STRATA_GDN_PP" && t[1].second == "2");
+        CHECK(arch_default_env(a, true, false) == t);
+    }
+    put("STRATA_GFX1030_DEFAULTS", "0");
+    CHECK(arch_default_env("gfx1030").empty());
+    unset("STRATA_GFX1030_DEFAULTS");
     // gfx1151, plain and with its feature suffix: the table, and no bit-changing switch in it
     for (const char* a : {"gfx1151", "gfx1151:sramecc-:xnack-"}) {
         const auto t = arch_default_env(a);
