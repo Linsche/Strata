@@ -40,6 +40,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_pattn.hpp"
+#include "strata/kernels/qsa_pattn_flash.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -4069,6 +4070,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))
 #if !defined(STRATA_GPU_METAL)   // qsa_pattn.cu is in the CUDA / HIP kernel library only
+                        // STRATA_PATTN_FLASH=1|2 (qsa_pattn_flash.hpp, k8v4): the whole chunk in one pass; false runs on below
+                        if (!(strata::kernels::pattn_flash_mode() != 0 &&
+                              strata::kernels::qsa_pattn_flash_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn, T,
+                                                                     strata::kernels::pattn_flash_mode() == 2, m.cs)))
                         if (!(strata::kernels::pattn_mode() != 0 &&
                               strata::kernels::qsa_pattn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch,
                                                                (uint64_t) m.attn_batch *
@@ -6919,6 +6924,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
                         if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                                 m.attn, T, cs))
+#if !defined(STRATA_GPU_METAL)
+                        if (!(strata::kernels::pattn_flash_mode() != 0 &&
+                              strata::kernels::qsa_pattn_flash_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn, T,
+                                                                     strata::kernels::pattn_flash_mode() == 2, cs)))
+#endif
                             for (int64_t q0 = 0; q0 < T; q0 += m.attn_batch) {
                                 const int64_t nb = std::min(m.attn_batch, T - q0);
                                 strata::kernels::qsa_decode_attn_batch(m.q + q0 * ZV, pools, m.sel_ids + q0 * m.cap,
