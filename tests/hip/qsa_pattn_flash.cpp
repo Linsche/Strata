@@ -6,6 +6,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_pattn_flash.hpp"
 #include <cuda_runtime.h>
+#include <hip/hip_fp16.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
