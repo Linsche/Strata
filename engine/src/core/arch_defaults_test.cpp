@@ -2,6 +2,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/bw_dense_defaults.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/own_only_switches.hpp"
@@ -278,10 +279,10 @@ int main() {
     for (const Mock& m : mocks) {
         const bool want = m.expect_on && std::string(m.gcn).rfind("gfx1103", 0) == 0;
 #if defined(_WIN32)
-        // 0.2.8: Strix Halo (gfx1151, integrated) gets the matrix-core prompt set on Windows; the 780M and the 890M are
-        // not measured there and stay off
+        // 0.2.8 / 0.2.19: Strix Halo (gfx1151, integrated) gets the matrix-core prompt + Wave32 decode set on Windows;
+        // the 780M and the 890M stay opt-in there
         const bool win_on = m.expect_on && m.integrated && std::string(m.gcn).rfind("gfx1151", 0) == 0;
-        CHECK(igpu_default_env(m.gcn, m.integrated).size() == (win_on ? 9u : 0u));
+        CHECK(igpu_default_env(m.gcn, m.integrated).size() == (win_on ? 12u : 0u));
 #else
         CHECK(igpu_default_env(m.gcn, m.integrated).size() == (want ? 5u : 0u));
 #endif
@@ -317,14 +318,22 @@ int main() {
 #if defined(_WIN32)
             halo_win = std::string(m.gcn).rfind("gfx1151", 0) == 0;
 #endif
-            CHECK(t.size() == (halo_win ? 9u : 5u));
+            CHECK(t.size() == (halo_win ? 12u : 5u));
             std::vector<const char*> want = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_HC_UPMIX"};
             want.push_back("STRATA_SELECT_WMMA");
-            if (halo_win) { want.push_back("STRATA_PF_FUSED"); want.push_back("STRATA_PF_F16"); want.push_back("STRATA_PF_DM16"); want.push_back("STRATA_PF_P1A"); }
+            if (halo_win) {
+                want.push_back("STRATA_PF_FUSED"); want.push_back("STRATA_PF_DM16"); want.push_back("STRATA_PF_P1A");
+                want.push_back("STRATA_PF_P1A_L2"); want.push_back("STRATA_DFLASH_WMMA"); want.push_back("STRATA_HIP_FAST_DEC");
+            }
             for (const char* w : want) {
                 bool found = false;
                 for (const auto& kv : t) found = found || (kv.first == w && kv.second == "1");
                 CHECK(found);
+            }
+            if (halo_win) {
+                bool found_f16_2 = false;
+                for (const auto& kv : t) found_f16_2 = found_f16_2 || (kv.first == "STRATA_PF_F16" && kv.second == "2");
+                CHECK(found_f16_2);
             }
             for (const auto& kv : t) CHECK(kv.first != "STRATA_HC_Q8" && kv.first != "STRATA_PF_HCDOWN");
             if (!halo_win) { for (const auto& kv : t) CHECK(kv.first != "STRATA_PF_FUSED"); }
@@ -343,10 +352,11 @@ int main() {
     put("STRATA_IGPU_PROMPT_SET", "0");
     CHECK(igpu_default_env("gfx1103", true).empty());
     put("STRATA_IGPU_PROMPT_SET", "1");
-    // apply: a discrete card sets nothing, an iGPU sets the five, a switch the user set (even to 0) is kept
+    // apply: an unconfigured discrete card (gfx1030) sets nothing, an iGPU sets the five, a switch the user set (even to 0) is kept
+    // (discrete RDNA3 gfx1100/1101/1102 has its own suite in gfx11_extra.hpp, tested in gfx11_extra_test)
     const char* five[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"};
     for (const char* k : five) unset(k);
-    CHECK(apply_arch_defaults("gfx1100", false).empty());
+    CHECK(apply_arch_defaults("gfx1030", false).empty());
     // gfx12: a discrete RDNA4 card gets its own twelve switches (five prompt, seven decode); a second call has nothing to do
     const char* g12[] = {"STRATA_GDN_HEAD", "STRATA_GDN_PP",  "STRATA_GDN_CONVL2",    "STRATA_GDN_NOY", "STRATA_CVEC_FUSE",
                          "STRATA_ATTN_LANECELL", "STRATA_ATTN_MERGE_V2", "STRATA_TSUM", "STRATA_EXPDEC"};
@@ -386,27 +396,30 @@ int main() {
     CHECK(!igpu_prompt_set_enabled("gfx1103", true));
     {
         const auto t = igpu_default_env("gfx1151", true);
-        CHECK(t.size() == 9);
-        auto has = [&t](const char* k) {
-            for (const auto& kv : t) if (kv.first == k) return kv.second == "1";
+        CHECK(t.size() == 12);
+        auto has = [&t](const char* k, const char* v = "1") {
+            for (const auto& kv : t) if (kv.first == k) return kv.second == v;
             return false;
         };
         CHECK(has("STRATA_HIP_WMMA") && has("STRATA_PF_GEMM") && has("STRATA_PA_FAST") && has("STRATA_HC_UPMIX") &&
-              has("STRATA_PF_FUSED") && has("STRATA_SELECT_WMMA") && has("STRATA_PF_F16") && has("STRATA_PF_DM16") && has("STRATA_PF_P1A"));
+              has("STRATA_PF_FUSED") && has("STRATA_SELECT_WMMA") && has("STRATA_PF_F16", "2") && has("STRATA_PF_DM16") &&
+              has("STRATA_PF_P1A") && has("STRATA_PF_P1A_L2") && has("STRATA_DFLASH_WMMA") && has("STRATA_HIP_FAST_DEC"));
         CHECK(igpu_default_env("gfx1151", false).empty());   // a gfx1151 reported as a discrete card
         CHECK(igpu_default_env("gfx1150", true).empty());    // 890M: unchanged
         CHECK(igpu_default_env("gfx1103", true).empty());    // 780M on Windows: unchanged
     }
     {
         const char* halo[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_HC_UPMIX", "STRATA_PF_FUSED",
-                              "STRATA_SELECT_WMMA", "STRATA_PF_F16", "STRATA_PF_DM16", "STRATA_PF_P1A"};
+                              "STRATA_SELECT_WMMA", "STRATA_PF_F16", "STRATA_PF_DM16", "STRATA_PF_P1A", "STRATA_PF_P1A_L2",
+                              "STRATA_DFLASH_WMMA", "STRATA_HIP_FAST_DEC"};
         for (const char* k : halo) unset(k);
         const auto set = apply_arch_defaults("gfx1151", true);
         for (const char* k : halo) {
             bool in = false;
             for (const auto& n : set) in = in || n == k;
             CHECK(in);
-            CHECK(std::getenv(k) != nullptr && std::string(std::getenv(k)) == "1");
+            const char* want = std::strcmp(k, "STRATA_PF_F16") == 0 ? "2" : "1";
+            CHECK(std::getenv(k) != nullptr && std::string(std::getenv(k)) == want);
         }
         // a switch the user set (even to 0) is kept, and the whole set turns off with either switch
         for (const char* k : halo) unset(k);
@@ -460,8 +473,8 @@ int main() {
 #if !defined(_WIN32)
     {   // apply: nothing set -> STRATA_PF_FUSED=1 on the class, =0 (the way back) and =1 as the user set them are kept, other devices get nothing
         unset("STRATA_PF_FUSED");
-        apply_arch_defaults("gfx1100", false);
-        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // discrete
+        apply_arch_defaults("gfx1030", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // unconfigured discrete (discrete RDNA3 is tested in gfx11_extra_test)
         apply_arch_defaults("gfx1103", false);
         CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // a mixed box (iGPU + dGPU)
         apply_arch_defaults("gfx1201", false);
@@ -554,12 +567,28 @@ int main() {
         CHECK(route_prior_default(false, false, 8.0 * GiB, true) == 0.0f);
         // an explicit STRATA_ROUTE_PRIOR=1.5 wins over 026 as well
         CHECK(route_prior_resolve("1.5", false, false, 12.0 * GiB, true) == 1.5f);
+        // the window warm-up (#6171): on by default, off while the route prior is on (the dummy token's paged-in experts bend the first request), the variable decides when set
+        CHECK(window_warm_on(nullptr, 0.0f));
+        CHECK(!window_warm_on(nullptr, 1.5f));
+        CHECK(window_warm_on(nullptr, route_prior_resolve(nullptr, false, false, 12.0 * GiB)));   // nothing set: the prior is off, the warm-up stays
+        CHECK(!window_warm_on(nullptr, route_prior_resolve("1.5", false, false, 12.0 * GiB)));
+        CHECK(window_warm_on(nullptr, route_prior_resolve("0", false, false, 12.0 * GiB)));
+        CHECK(!window_warm_on("0", 0.0f) && !window_warm_on("0", 1.5f));
+        CHECK(window_warm_on("1", 1.5f) && window_warm_on("1", 0.0f));
         // the wide HC up read: on for a 12.0 card on CUDA, off under 026, off in HIP, off on sm_86 / sm_121
         CHECK(gr_up_wide_default(false, 12, 0));
         CHECK(!gr_up_wide_default(false, 12, 0, true));
         CHECK(!gr_up_wide_default(true, 12, 0));
         CHECK(!gr_up_wide_default(false, 8, 6));
-        CHECK(!gr_up_wide_default(false, 12, 1));
+        CHECK(gr_up_wide_default(false, 12, 1) == kGb10GrUpWide);          // GB10: the BW-7 constant (the 12.0 rule is the line above)
+        // BW-7: the 12.0 set on a GB10 (sm_121): per-switch constants, STRATA_SM121_PERF (unset here) and STRATA_DEFAULTS=026 turn them off; 12.0 and the rest unchanged
+        CHECK(sm12x_default_v(12, 0, false, false) && sm12x_default_v(12, 0, true, false));
+        CHECK(!sm12x_default_v(12, 1, false, false));
+        CHECK(sm12x_default_v(12, 1, true, false));
+        CHECK(!sm12x_default_v(12, 1, true, true));
+        CHECK(!sm12x_default_v(8, 6, true, false) && !sm12x_default_v(10, 0, true, false) && !sm12x_default_v(7, 5, true, false));
+        CHECK(small_unr_default(12, 0) == 3 && small_unr_default(12, 1) == (kGb10SmallUnr ? 3 : 0) && small_unr_default(8, 6) == 0);
+        CHECK(gr_v3_pf_default(12, 0) == 133 && gr_v3_pf_default(12, 1) == (kGb10GrV3Pf ? 133 : 0) && gr_v3_pf_default(8, 6) == 0);
         // #3453: the sm_89 MMVQ-IL tables: on by default for compute capability 8.9 only, off under 026 and in HIP; "1" and "0" win
         CHECK(mmvq_il_89_default(false, 89));
         CHECK(!mmvq_il_89_default(false, 86) && !mmvq_il_89_default(false, 80) && !mmvq_il_89_default(false, 90) &&
@@ -650,7 +679,9 @@ int main() {
         CHECK(!gr_v3_default(false, 8, 6, false, 15.7 * GiB));              // 2x RTX A4000 (sm_86): measured -3.0% / -5.9%
         CHECK(!gr_v3_default(false, 8, 6, false, 72.0 * GiB));              // any sm_86
         CHECK(!gr_v3_default(false, 8, 9, false, 24.0 * GiB));              // sm_89
-        CHECK(!gr_v3_default(false, 12, 1, false, 128.0 * GiB));            // sm_121 (DGX Spark class): not 12.0
+        CHECK(gr_v3_default(false, 12, 1, true, 128.0 * GiB) == kGb10GrV3);  // sm_121 (DGX Spark class, integrated): the BW-7 constant; never on without it
+        CHECK(!gr_v3_default(false, 12, 1, true, 128.0 * GiB, true));       // STRATA_DEFAULTS=026 turns it off there too
+        CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // an integrated 12.0 part: still off (unchanged)
         CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // integrated
         CHECK(!gr_v3_default(true, 12, 0, false, 32.0 * GiB));              // a HIP build: gfx1201 reports 12.0 too
         CHECK(!gr_v3_default(false, 6, 0, false, 16.0 * GiB));              // P100
