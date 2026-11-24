@@ -22,7 +22,6 @@ strata launch --family qwen36 --model ud-q4_k_xl --vision on --parallel 2
 | `--vision on\|off\|gpu\|cpu` | Terminal: pictures and which reader. Source setup uses `--vision yes\|no\|gpu\|cpu` and `--vision-tokens N`. |
 | `--parallel N` | How many requests are answered at once, 1 to 8. Source setup has the same option. |
 | `--prefill 512` | Engine flag in the config's `args`, not a `strata launch` option: the prompt chunk size ([Prompt chunk](#prompt-chunk)). |
-| `--kv fp16\|k8v4` | Engine flag in the config's `args`: a smaller cache for the context, so more experts fit in VRAM ([Context cache](#context-cache)). Off by default. |
 
 ## Pictures
 
@@ -112,35 +111,6 @@ slower). `--prefill 512` (or `STRATA_Q36_CHUNK=512`) gives the 512 size, and the
 for bit. The chunk size changes the GEMM tiles the BLAS picks and with them the last bits of the prompt state. This is
 the size of the llama.cpp CPU-against-HIP difference on the same file, not a quality loss. A prompt shorter than the
 chunk (every chat turn after the first) is one chunk either way.
-
-## Context cache
-
-By default the engine keeps the context's keys and values in fp32: 45 KB per token, 5.5 GB at 128K. On a card that
-does not hold every expert, that room is taken from the experts. `--kv` in the config's `args` makes the cache smaller:
-
-| `--kv` | Per token | At 128K | What it is |
-| --- | ---: | ---: | --- |
-| `fp32` (default) | 45 KB | 5.5 GB | unchanged |
-| `fp16` | 22.5 KB | 2.75 GB | half precision; the prompt attention reads the cache directly |
-| `k8v4` | 9 KB | 1.1 GB | keys in 8 bit, values in 4 bit, one scale per 32 values |
-
-> **Measured on:** Radeon RX 6800 16 GB (HIP gfx1030), Ryzen 7 5700X, UD-Q4_K_XL, `--max-context 131072`, Strata
-> 0.2.13.1 with this change. Quality: the 10 parity prompts and fp32's greedy answers, teacher-forced (969 steps),
-> against fp32. The noise row is fp32 with `--prefill 512` instead of the default chunk 2048.
-
-| | fp32 | fp16 | k8v4 |
-| --- | ---: | ---: | ---: |
-| VRAM free after start | 3.18 GB | 6.18 GB | 7.56 GB |
-| Experts per layer in VRAM | 18 of 256 | 59 | 77 |
-| Decode, short prompts, `--mtp 2` (10 prompts) | 50 to 56 tok/s | 53 to 74 | 58 to 83 |
-| Decode after a 32K prompt (`--bench-pp 32768 --bench-tg 128`) | 23.1 tok/s | 31.9 | 40.5 |
-| Prompt read, 32K | 655 tok/s | 656 | 655 |
-| Mean KL to fp32 (noise: 2.5e-3) | 0 | 2.1e-3 | 5.3e-3 |
-| Top-1 same as fp32 (noise: 955 of 969) | 969 | 956 | 947 |
-
-fp16 is as close to fp32 as a different prompt chunk is. k8v4 is about twice that distance. With the default fp32 the
-text is the same as before, bit for bit (10 of 10 prompts). Several requests at once work with every format (the batch
-gate passes with `--batch 2` for fp32, fp16 and k8v4).
 
 ## Speed and exactness
 
